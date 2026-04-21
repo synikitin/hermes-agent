@@ -46,6 +46,7 @@ from gateway.platforms.base import (
     SendResult,
     is_network_accessible,
 )
+from gateway.platforms import metrics as _metrics
 
 logger = logging.getLogger(__name__)
 
@@ -566,6 +567,23 @@ class APIServerAdapter(BasePlatformAdapter):
     # HTTP Handlers
     # ------------------------------------------------------------------
 
+    async def _handle_metrics(self, request: "web.Request") -> "web.Response":
+        """GET /metrics — Prometheus text-format scrape endpoint.
+
+        Always returns 200 even when prometheus_client is not installed, in
+        which case the body is empty and the content type is the standard
+        Prometheus exposition format. No auth is required by design — match
+        the convention of every other /metrics endpoint in the ecosystem.
+
+        ``content_type`` is set via ``headers=`` (not the kwarg) because
+        prometheus_client's ``CONTENT_TYPE_LATEST`` includes a charset
+        parameter, which ``web.Response(content_type=...)`` rejects.
+        """
+        return web.Response(
+            body=_metrics.render(),
+            headers={"Content-Type": _metrics.content_type()},
+        )
+
     async def _handle_health(self, request: "web.Request") -> "web.Response":
         """GET /health — simple health check."""
         return web.json_response({"status": "ok", "platform": "hermes-agent"})
@@ -1072,6 +1090,25 @@ class APIServerAdapter(BasePlatformAdapter):
         agent_error: Optional[str] = None
         usage: Dict[str, int] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 
+        # ZONA-FORK observability: per-stream lifecycle instrumentation.
+        # Counters/histograms feed Prometheus; structured log lines carry
+        # X-Request-Id from the caller (Zona FastAPI) so a single id pierces
+        # both services in centralized logs.
+        _t_start = time.monotonic()
+        _request_id = request.headers.get("X-Request-Id") or response_id
+        _stream_log_ctx = {
+            "response_id": response_id,
+            "request_id": _request_id,
+            "model": model,
+            "conversation": conversation,
+            "session_id": session_id,
+        }
+        _first_token_observed = False
+        _tokens_emitted = 0
+        _client_disconnected = False
+        _metrics.responses_streaming_active.inc()
+        logger.info("responses.stream_open", extra=_stream_log_ctx)
+
         try:
             # response.created — initial envelope, status=in_progress
             created_env = _envelope("in_progress")
@@ -1105,6 +1142,17 @@ class APIServerAdapter(BasePlatformAdapter):
                 })
 
             async def _emit_text_delta(delta_text: str) -> None:
+                nonlocal _first_token_observed, _tokens_emitted
+                if not _first_token_observed:
+                    _first_token_observed = True
+                    _first_token_latency = time.monotonic() - _t_start
+                    _metrics.responses_first_token_seconds.observe(_first_token_latency)
+                    logger.info(
+                        "responses.first_token",
+                        extra={**_stream_log_ctx, "latency_ms": int(_first_token_latency * 1000)},
+                    )
+                _tokens_emitted += 1
+                _metrics.responses_tokens_emitted_total.labels(model=model).inc()
                 await _open_message_item()
                 final_text_parts.append(delta_text)
                 await _write_event("response.output_text.delta", {
@@ -1132,6 +1180,12 @@ class APIServerAdapter(BasePlatformAdapter):
                     arguments_str = json.dumps(args)
                 else:
                     arguments_str = str(args)
+                _tool_name_label = payload.get("name") or "unknown"
+                _metrics.responses_tool_calls_total.labels(tool_name=_tool_name_label).inc()
+                logger.info(
+                    "responses.tool_call",
+                    extra={**_stream_log_ctx, "tool": _tool_name_label, "call_id": call_id},
+                )
                 item = {
                     "id": f"fc_{uuid.uuid4().hex[:24]}",
                     "type": "function_call",
@@ -1356,11 +1410,23 @@ class APIServerAdapter(BasePlatformAdapter):
                 # Persist for future chaining / GET retrieval, mirroring
                 # the batch path behavior.
                 if store:
-                    full_history = list(conversation_history)
-                    full_history.append({"role": "user", "content": user_message})
-                    if isinstance(result, dict) and result.get("messages"):
-                        full_history.extend(result["messages"])
+                    # ZONA-FORK FIX (doubling regression):
+                    # ``result["messages"]`` already starts with a copy of
+                    # ``conversation_history`` (see run_agent.py
+                    # ``messages = list(conversation_history) ...``) and is
+                    # appended to in place across the turn. Concatenating the
+                    # prior history again — as upstream does today — doubles
+                    # stored history every turn.
+                    #
+                    # Use ``result["messages"]`` directly when available, and
+                    # fall back to the manual reconstruction only when the
+                    # agent did not return a messages list (rare error path).
+                    agent_messages = result.get("messages") if isinstance(result, dict) else None
+                    if agent_messages:
+                        full_history = list(agent_messages)
                     else:
+                        full_history = list(conversation_history)
+                        full_history.append({"role": "user", "content": user_message})
                         full_history.append({"role": "assistant", "content": final_response_text})
                     self._response_store.put(response_id, {
                         "response": completed_env,
@@ -1370,10 +1436,12 @@ class APIServerAdapter(BasePlatformAdapter):
                     })
                     if conversation:
                         self._response_store.set_conversation(conversation, response_id)
+                    _metrics.responses_history_length.labels(status="store").observe(len(full_history))
 
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
             # Client disconnected — interrupt the agent so it stops
             # making upstream LLM calls, then cancel the task.
+            _client_disconnected = True
             agent = agent_ref[0] if agent_ref else None
             if agent is not None:
                 try:
@@ -1386,7 +1454,34 @@ class APIServerAdapter(BasePlatformAdapter):
                     await agent_task
                 except (asyncio.CancelledError, Exception):
                     pass
-            logger.info("SSE client disconnected; interrupted agent task %s", response_id)
+            logger.info(
+                "responses.stream_aborted",
+                extra={
+                    **_stream_log_ctx,
+                    "reason": "client_disconnect",
+                    "elapsed_ms": int((time.monotonic() - _t_start) * 1000),
+                },
+            )
+        finally:
+            _metrics.responses_streaming_active.dec()
+            _elapsed = time.monotonic() - _t_start
+            if agent_error:
+                _status_label = "failed"
+            elif _client_disconnected:
+                _status_label = "aborted"
+            else:
+                _status_label = "completed"
+            _metrics.responses_total_duration_seconds.labels(status=_status_label).observe(_elapsed)
+            logger.info(
+                "responses.stream_complete",
+                extra={
+                    **_stream_log_ctx,
+                    "status": _status_label,
+                    "total_ms": int(_elapsed * 1000),
+                    "tokens_emitted": _tokens_emitted,
+                    "tool_calls": call_counter,
+                },
+            )
 
         return response
 
@@ -1601,15 +1696,17 @@ class APIServerAdapter(BasePlatformAdapter):
         response_id = f"resp_{uuid.uuid4().hex[:28]}"
         created_at = int(time.time())
 
-        # Build the full conversation history for storage
-        # (includes tool calls from the agent run)
-        full_history = list(conversation_history)
-        full_history.append({"role": "user", "content": user_message})
-        # Add agent's internal messages if available
-        agent_messages = result.get("messages", [])
+        # ZONA-FORK FIX (doubling regression):
+        # ``result["messages"]`` already starts with a copy of
+        # ``conversation_history`` and is appended to in place by
+        # ``run_conversation``. Re-prepending ``conversation_history`` doubles
+        # stored history on every turn. Use the agent's messages directly.
+        agent_messages = result.get("messages") or []
         if agent_messages:
-            full_history.extend(agent_messages)
+            full_history = list(agent_messages)
         else:
+            full_history = list(conversation_history)
+            full_history.append({"role": "user", "content": user_message})
             full_history.append({"role": "assistant", "content": final_response})
 
         # Build output items (includes tool calls + final message)
@@ -1641,6 +1738,9 @@ class APIServerAdapter(BasePlatformAdapter):
             # conversation name automatically chains to this response
             if conversation:
                 self._response_store.set_conversation(conversation, response_id)
+            _metrics.responses_history_length.labels(status="store").observe(len(full_history))
+        else:
+            _metrics.responses_history_length.labels(status="skip").observe(len(full_history))
 
         return web.json_response(response_data)
 
@@ -2313,6 +2413,7 @@ class APIServerAdapter(BasePlatformAdapter):
             mws = [mw for mw in (cors_middleware, body_limit_middleware, security_headers_middleware) if mw is not None]
             self._app = web.Application(middlewares=mws)
             self._app["api_server_adapter"] = self
+            self._app.router.add_get("/metrics", self._handle_metrics)
             self._app.router.add_get("/health", self._handle_health)
             self._app.router.add_get("/health/detailed", self._handle_health_detailed)
             self._app.router.add_get("/v1/health", self._handle_health)

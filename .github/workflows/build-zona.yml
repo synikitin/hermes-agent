@@ -1,0 +1,119 @@
+# Build the forked Hermes base image and push to Zona's ECR repository.
+#
+# This workflow lives only on the zona/main branch (it is rebased forward on
+# upstream releases but never proposed back to NousResearch/hermes-agent).
+#
+# Trust path:
+#   GitHub Actions OIDC -> AWS IAM role `zona-hermes-fork-ecr-push`
+#   (provisioned in the Zona Terraform; trust policy locked to this repo +
+#    branch via the `sub` claim).
+#
+# Required repository secrets (configure under
+# https://github.com/synikitin/hermes-agent/settings/secrets/actions):
+#   AWS_ROLE_TO_ASSUME       arn:aws:iam::<acct>:role/zona-hermes-fork-ecr-push
+#   AWS_REGION               us-east-1
+#   ECR_REPOSITORY           zona-hermes-base
+#
+# The two image tags pushed per build:
+#   :zona-stable  — moving pointer that Zona's Dockerfile.hermes consumes
+#   :<git-sha>    — immutable tag for rollback
+name: build-zona
+
+on:
+  push:
+    branches:
+      - zona/main
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  id-token: write   # required for AWS OIDC
+
+concurrency:
+  group: build-zona-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-and-push:
+    name: Test gateway + push to ECR
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        run: curl -LsSf https://astral.sh/uv/install.sh | sh
+
+      - name: Install gateway test deps
+        run: |
+          set -euo pipefail
+          source $HOME/.local/bin/env
+          uv pip install --system -e '.[dev,test]' || \
+            uv pip install --system -e '.[dev]' || \
+            uv pip install --system pytest pytest-asyncio aiohttp httpx
+
+      - name: Run gateway tests (gating)
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          # Gate on the test files Zona actually depends on — full upstream
+          # suite covers many environments we do not deploy.
+          python -m pytest -x -q \
+            tests/gateway/test_responses_streaming.py \
+            tests/gateway/test_responses_chaining.py \
+            tests/gateway/test_api_server.py
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ secrets.AWS_REGION }}
+          role-session-name: hermes-fork-build-${{ github.run_id }}
+
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build image
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+          SHA_TAG: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          docker build \
+            --tag "$REGISTRY/$REPOSITORY:zona-stable" \
+            --tag "$REGISTRY/$REPOSITORY:$SHA_TAG" \
+            -f Dockerfile .
+
+      - name: Push image
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+          SHA_TAG: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          docker push "$REGISTRY/$REPOSITORY:zona-stable"
+          docker push "$REGISTRY/$REPOSITORY:$SHA_TAG"
+
+      - name: Summary
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+          SHA_TAG: ${{ github.sha }}
+        run: |
+          {
+            echo "## Pushed Hermes base image"
+            echo ""
+            echo "- \`${REGISTRY}/${REPOSITORY}:zona-stable\`"
+            echo "- \`${REGISTRY}/${REPOSITORY}:${SHA_TAG}\`"
+            echo ""
+            echo "Zona's deploy.yml will pick up :zona-stable on next deploy."
+          } >> "$GITHUB_STEP_SUMMARY"
